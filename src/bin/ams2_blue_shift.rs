@@ -1,16 +1,18 @@
 use std::env;
 use std::error::Error;
 use std::io;
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use moza_rev::device::moza_led::MozaLedDevice;
 use moza_rev::led::blue_shift::{BlueShiftMapper, LED_COUNT};
 use moza_rev::moza::{self, Protocol};
 use moza_rev::telemetry::engine::EngineSample;
-use moza_rev::telemetry::pc2::{DEFAULT_PORT as PC2_PORT, Pc2Adapter};
+use moza_rev::telemetry::pc2::{self, DEFAULT_PORT as PC2_PORT};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT: Duration = Duration::from_millis(250);
+const READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 const DEFAULT_NORMAL_COLORS: [[u8; 3]; LED_COUNT] = [
     [0, 255, 0],
@@ -68,9 +70,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // This replaces the need to click Boxflat's telemetry test.
     wheel.initialize(&normal_colors)?;
 
-    let mut telemetry = Pc2Adapter::bind(PC2_PORT)?;
+    let socket = UdpSocket::bind(("0.0.0.0", PC2_PORT))?;
+    socket.set_read_timeout(Some(READ_TIMEOUT))?;
     println!("Listening for PC2/Madness telemetry on UDP {PC2_PORT}");
 
+    let mut buffer = vec![0_u8; 2048];
     let mut latest: Option<(EngineSample, Instant)> = None;
     let mut mapper = BlueShiftMapper::new(
         led_start,
@@ -84,8 +88,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut last_status = Instant::now();
 
     loop {
-        if let Some(sample) = telemetry.recv()? {
-            latest = Some((sample, Instant::now()));
+        match socket.recv(&mut buffer) {
+            Ok(length) => {
+                if let Some(sample) = pc2::decode(&buffer[..length]) {
+                    latest = Some((sample, Instant::now()));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error.into()),
         }
 
         let now = Instant::now();

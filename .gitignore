@@ -27,3 +27,5 @@ target
 
 # Claude Code local overrides (per-developer; not for the repo)
 .claude/settings.local.json
+
+.vscode/

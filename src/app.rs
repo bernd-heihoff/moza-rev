@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
+use moza_rev::device::moza_led::MozaLedDevice;
+use moza_rev::led::blue_shift::BlueShiftMapper;
 use moza_rev::listeners::{self, EngineState, GameId, Update};
 use moza_rev::moza::{self, BaseTemps, Moza, Protocol};
 
@@ -34,9 +36,14 @@ const TEMP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Per-sensor read timeout. Each `read_base_temps` call does three sequential
 /// reads, so worst-case wall time is 3x this if all sensors fail to respond.
 const TEMP_READ_DEADLINE: Duration = Duration::from_millis(300);
-/// `recv_timeout` window so the loop wakes regularly to do thermal polling
-/// and idle-detection even when no telemetry is arriving.
-const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+/// Wake often enough to maintain the blue shift-light flash cadence even
+/// when telemetry packets arrive slowly or briefly pause.
+const RECV_TIMEOUT: Duration = Duration::from_millis(20);
+
+const DEFAULT_LED_START: f32 = 0.70;
+const DEFAULT_FLASH_AT: f32 = 0.95;
+const DEFAULT_FLASH_HYSTERESIS: f32 = 0.02;
+const DEFAULT_FLASH_MS: u64 = 100;
 
 // Approximate "elevated" thresholds. Moza firmware auto-protects somewhere
 // above these; the goal is to surface unusual heat well before that fires.
@@ -45,55 +52,109 @@ const MOSFET_TEMP_WARN_C: f32 = 70.0;
 const MOTOR_TEMP_WARN_C: f32 = 95.0;
 
 /// Open the Moza wheelbase, honouring an explicit `--serial` if the user
-/// supplied one or autodetecting otherwise. Returns `None` if no wheel is
-/// reachable; the caller chooses whether that's fatal (startup) or just a
-/// reconnect-attempt failure (mid-run after a USB unplug).
+/// supplied one or autodetecting otherwise. Modern wheels are also put into
+/// host-driven RPM mode and receive the normal runtime color table here, so
+/// every reconnect restores a complete LED state before the main loop resumes.
 fn open_wheel(
     user_serial: Option<&str>,
     user_protocol: Option<Protocol>,
+    leds: &MozaLedDevice,
+    normal_colors: &[[u8; 3]],
 ) -> Option<(String, Protocol, Moza)> {
     let path = match user_serial {
         Some(p) => p.to_string(),
         None => moza::find_wheelbase()?,
     };
     let protocol = user_protocol.unwrap_or_else(|| moza::detect_protocol(&path));
-    match Moza::open(&path, protocol) {
-        Ok(w) => Some((path, protocol, w)),
+    let mut wheel = match Moza::open(&path, protocol) {
+        Ok(wheel) => wheel,
         Err(e) => {
             debug!("open Moza at {path}: {e}");
-            None
+            return None;
         }
+    };
+
+    if protocol == Protocol::Modern
+        && let Err(e) = leds.initialize(&mut wheel, normal_colors)
+    {
+        debug!("initialize modern RPM LEDs at {path}: {e}");
+        return None;
     }
+
+    Some((path, protocol, wheel))
 }
 
 pub fn run(args: ListenArgs) -> ExitCode {
     let user_serial = args.serial.clone();
     let user_protocol = args.protocol.map(Protocol::from);
+    let led_count = args.leds;
+    let verbose = args.verbose;
+
+    let leds = MozaLedDevice::new(led_count);
+    let flash_at =
+        env_fraction_with_fallback("MOZA_REV_FLASH_AT", "MOZA_REV_LED_FULL", DEFAULT_FLASH_AT)
+            .clamp(0.05, 1.0);
+    let led_start =
+        env_fraction("MOZA_REV_LED_START", DEFAULT_LED_START).clamp(0.0, flash_at - 0.01);
+    let flash_hysteresis =
+        env_fraction("MOZA_REV_FLASH_HYSTERESIS", DEFAULT_FLASH_HYSTERESIS).clamp(0.0, flash_at);
+    let flash_ms = env_u64("MOZA_REV_FLASH_MS", DEFAULT_FLASH_MS).max(40);
+    let normal_colors = load_normal_colors(led_count);
+    let flash_color = std::env::var("MOZA_REV_FLASH_COLOR")
+        .ok()
+        .as_deref()
+        .and_then(parse_rgb)
+        .unwrap_or([0, 0, 255]);
+    let flash_colors = vec![flash_color; led_count];
+    let mut shift_mapper = BlueShiftMapper::new(
+        led_count,
+        led_start,
+        flash_at,
+        flash_hysteresis,
+        Duration::from_millis(flash_ms),
+        Instant::now(),
+    );
+
+    info!(
+        "modern shift lights: start {:.0}%, flash {:.0}%, release {:.0}%, {} ms on/off",
+        led_start * 100.0,
+        flash_at * 100.0,
+        (flash_at - flash_hysteresis) * 100.0,
+        flash_ms,
+    );
 
     // Try to open the wheel once at startup, but don't make it fatal: a
     // systemd service may launch before the wheel is plugged in. The
     // main loop's reconnect cycle picks it up whenever it appears.
-    let (mut wheel, mut last_reconnect) = match open_wheel(user_serial.as_deref(), user_protocol) {
-        Some((path, protocol, w)) => {
-            info!("Moza wheelbase connected at {path} ({protocol:?} protocol)");
-            (Some(w), Instant::now())
-        }
-        None => {
-            warn!(
-                "no Moza wheelbase found yet; will keep retrying every {}s. \
-                 plug it in, or pass --serial /dev/ttyACMx to pin a path",
-                RECONNECT_INTERVAL.as_secs()
-            );
-            // Make the first reconnect attempt fire on the very next loop
-            // tick rather than waiting a full interval.
-            (
-                None,
-                Instant::now()
-                    .checked_sub(RECONNECT_INTERVAL)
-                    .unwrap_or_else(Instant::now),
-            )
-        }
-    };
+    let (mut wheel, mut wheel_protocol, mut applied_flash_mode, mut last_reconnect) =
+        match open_wheel(user_serial.as_deref(), user_protocol, &leds, &normal_colors) {
+            Some((path, protocol, wheel)) => {
+                info!("Moza wheelbase connected at {path} ({protocol:?} protocol)");
+                (
+                    Some(wheel),
+                    Some(protocol),
+                    (protocol == Protocol::Modern).then_some(false),
+                    Instant::now(),
+                )
+            }
+            None => {
+                warn!(
+                    "no Moza wheelbase found yet; will keep retrying every {}s. \
+                     plug it in, or pass --serial /dev/ttyACMx to pin a path",
+                    RECONNECT_INTERVAL.as_secs()
+                );
+                // Make the first reconnect attempt fire on the very next loop
+                // tick rather than waiting a full interval.
+                (
+                    None,
+                    user_protocol,
+                    None,
+                    Instant::now()
+                        .checked_sub(RECONNECT_INTERVAL)
+                        .unwrap_or_else(Instant::now),
+                )
+            }
+        };
 
     let (tx, rx) = mpsc::channel::<Update>();
     if !listeners::wreckfest_2::spawn(args.wf2_port, tx.clone()) {
@@ -113,9 +174,6 @@ pub fn run(args: ListenArgs) -> ExitCode {
     }
     listeners::assetto_corsa::spawn(args.ac_port, tx);
 
-    let led_count = args.leds;
-    let verbose = args.verbose;
-
     // When running alongside Boxflat, leave all serial reads to Boxflat.
     let temp_poll_enabled = std::env::var_os("MOZA_REV_NO_TEMP_POLL").is_none();
 
@@ -129,34 +187,56 @@ pub fn run(args: ListenArgs) -> ExitCode {
     let mut last_status = Instant::now();
     let mut last_temp_poll = Instant::now() - TEMP_POLL_INTERVAL; // poll once on startup
     let mut active_game: Option<GameId> = None;
+    let mut last_engine: Option<EngineState> = None;
     let mut last_packet_at: Option<Instant> = None;
     let mut packets_since_status: u32 = 0;
 
     loop {
         // Reconnect attempt if the wheel got unplugged. Quiet at debug
         // until the open succeeds; info-level chatter every 3s would
-        // be noisy. The transition log is in `open_wheel`'s caller.
+        // be noisy. Modern reconnects also restore telemetry mode/colors.
         if wheel.is_none() && last_reconnect.elapsed() >= RECONNECT_INTERVAL {
-            if let Some((path, _, w)) = open_wheel(user_serial.as_deref(), user_protocol) {
-                info!("Moza wheelbase connected at {path}");
-                wheel = Some(w);
-                // Force the next heartbeat to re-send the bitmask so the
-                // bar matches engine state immediately rather than waiting
-                // for the next change.
+            if let Some((path, protocol, reconnected)) =
+                open_wheel(user_serial.as_deref(), user_protocol, &leds, &normal_colors)
+            {
+                info!("Moza wheelbase connected at {path} ({protocol:?} protocol)");
+                wheel_protocol = Some(protocol);
+                applied_flash_mode = (protocol == Protocol::Modern).then_some(false);
+                wheel = Some(reconnected);
+                // Force the current LED state to be applied immediately.
                 last_bitmask = None;
             }
             last_reconnect = Instant::now();
         }
 
         if temp_poll_enabled && last_temp_poll.elapsed() >= TEMP_POLL_INTERVAL {
-            if let Some(w) = wheel.as_mut() {
-                poll_temps(w);
+            if let Some(wheel) = wheel.as_mut() {
+                poll_temps(wheel);
             }
             last_temp_poll = Instant::now();
         }
 
-        // Idle timeout: clear the active-game state so the next heartbeat
-        // writes 0 to the bar.
+        let update = match rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(update) => Some(update),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                error!("all listener threads exited; shutting down");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if let Some(update) = update {
+            if active_game != Some(update.game) {
+                info!("telemetry stream from {} started", update.game.name());
+                active_game = Some(update.game);
+            }
+            last_engine = Some(update.engine);
+            last_packet_at = Some(Instant::now());
+            packets_since_status += 1;
+        }
+
+        // Idle timeout: clear the active-game state. The shift mapper then
+        // exits flash mode and the desired mask becomes zero.
         if let Some(t) = last_packet_at
             && t.elapsed() >= IDLE_TIMEOUT
             && let Some(game) = active_game
@@ -169,70 +249,92 @@ pub fn run(args: ListenArgs) -> ExitCode {
             active_game = None;
         }
 
-        // Heartbeat keepalive. Always write at least once per
-        // HEARTBEAT_INTERVAL, even with no telemetry: this keeps the
-        // bar refreshed AND surfaces a USB unplug as a write error
-        // within ~1-2s, which would otherwise go unnoticed in idle mode.
-        if last_send.elapsed() >= HEARTBEAT_INTERVAL {
+        let now = Instant::now();
+        let modern = wheel_protocol == Some(Protocol::Modern);
+        let (bitmask, flash_mode) = if modern {
+            let ratio = if active_game.is_some() {
+                last_engine.as_ref().and_then(engine_rpm_ratio)
+            } else {
+                None
+            };
+            let output = shift_mapper.update(ratio, now);
+            (output.mask, Some(output.flash_mode))
+        } else {
             let bitmask = if active_game.is_some() {
-                last_bitmask.unwrap_or(0)
+                last_engine
+                    .as_ref()
+                    .map_or(0, |engine| rpm_to_bitmask(engine, led_count))
             } else {
                 0
             };
-            wheel = try_write(wheel.take(), bitmask, led_count, &mut last_reconnect);
-            last_bitmask = Some(bitmask);
-            last_send = Instant::now();
-        }
-
-        let update = match rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(u) => u,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                error!("all listener threads exited; shutting down");
-                return ExitCode::FAILURE;
-            }
+            (bitmask, None)
         };
 
-        if active_game != Some(update.game) {
-            info!("telemetry stream from {} started", update.game.name());
-            active_game = Some(update.game);
+        // Modern wheels can switch the runtime color table. Turn the LEDs
+        // off before swapping colors, then force the desired mask to be sent.
+        if modern
+            && let Some(flash_mode) = flash_mode
+            && applied_flash_mode != Some(flash_mode)
+            && wheel.is_some()
+        {
+            let colors = if flash_mode {
+                &flash_colors
+            } else {
+                &normal_colors
+            };
+            wheel = try_set_colors(wheel.take(), &leds, colors, &mut last_reconnect);
+            if wheel.is_some() {
+                applied_flash_mode = Some(flash_mode);
+                last_bitmask = None;
+            } else {
+                applied_flash_mode = None;
+                last_bitmask = None;
+            }
         }
-        last_packet_at = Some(Instant::now());
-        packets_since_status += 1;
 
-        let bitmask = rpm_to_bitmask(&update.engine, led_count);
-        if Some(bitmask) != last_bitmask {
-            wheel = try_write(wheel.take(), bitmask, led_count, &mut last_reconnect);
-            last_bitmask = Some(bitmask);
-            last_send = Instant::now();
+        // Send on change and at least once per heartbeat. Besides keeping the
+        // bar refreshed, the heartbeat surfaces USB unplug errors while idle.
+        if wheel.is_some()
+            && (last_bitmask != Some(bitmask) || last_send.elapsed() >= HEARTBEAT_INTERVAL)
+        {
+            wheel = try_write(wheel.take(), &leds, bitmask, &mut last_reconnect);
+            if wheel.is_some() {
+                last_bitmask = Some(bitmask);
+            } else {
+                last_bitmask = None;
+                applied_flash_mode = None;
+            }
+            last_send = now;
         }
 
-        if verbose {
-            print_status(
-                update.game,
-                &update.engine,
-                bitmask,
-                led_count,
-                packets_since_status,
-                false, // verbose: one line per packet, never overwrite
-            );
-            packets_since_status = 0;
-        } else if inplace_status && last_status.elapsed() >= STATUS_INTERVAL {
-            // Rolling status only when stdout is a real TTY (so the `\r`
-            // overwrite keeps it to one visible line). On systemd /
-            // piped output the connect/disconnect lifecycle lines plus
-            // `--verbose` are the way to see what's happening; flooding
-            // the journal with 2 status lines per second is useless.
-            print_status(
-                update.game,
-                &update.engine,
-                bitmask,
-                led_count,
-                packets_since_status,
-                inplace_status,
-            );
-            last_status = Instant::now();
-            packets_since_status = 0;
+        if let Some(update) = update {
+            if verbose {
+                print_status(
+                    update.game,
+                    &update.engine,
+                    bitmask,
+                    led_count,
+                    packets_since_status,
+                    false, // verbose: one line per packet, never overwrite
+                );
+                packets_since_status = 0;
+            } else if inplace_status && last_status.elapsed() >= STATUS_INTERVAL {
+                // Rolling status only when stdout is a real TTY (so the `\r`
+                // overwrite keeps it to one visible line). On systemd /
+                // piped output the connect/disconnect lifecycle lines plus
+                // `--verbose` are the way to see what's happening; flooding
+                // the journal with 2 status lines per second is useless.
+                print_status(
+                    update.game,
+                    &update.engine,
+                    bitmask,
+                    led_count,
+                    packets_since_status,
+                    inplace_status,
+                );
+                last_status = Instant::now();
+                packets_since_status = 0;
+            }
         }
     }
 }
@@ -242,19 +344,116 @@ pub fn run(args: ListenArgs) -> ExitCode {
 /// success, `None` on failure or if `wheel` was already `None`.
 fn try_write(
     wheel: Option<Moza>,
+    leds: &MozaLedDevice,
     bitmask: u32,
-    led_count: usize,
     last_reconnect: &mut Instant,
 ) -> Option<Moza> {
-    let mut w = wheel?;
-    match w.send_rpm_bitmask(bitmask, led_count) {
-        Ok(()) => Some(w),
+    let mut wheel = wheel?;
+    match leds.set_mask(&mut wheel, bitmask) {
+        Ok(()) => Some(wheel),
         Err(e) => {
             warn!("Moza wheelbase write failed ({e}); will retry to connect");
             *last_reconnect = Instant::now();
             None
         }
     }
+}
+
+fn try_set_colors(
+    wheel: Option<Moza>,
+    leds: &MozaLedDevice,
+    colors: &[[u8; 3]],
+    last_reconnect: &mut Instant,
+) -> Option<Moza> {
+    let mut wheel = wheel?;
+    let result = leds
+        .set_mask(&mut wheel, 0)
+        .and_then(|()| leds.set_colors(&mut wheel, colors));
+    match result {
+        Ok(()) => Some(wheel),
+        Err(e) => {
+            warn!("Moza shift-light color write failed ({e}); will retry to connect");
+            *last_reconnect = Instant::now();
+            None
+        }
+    }
+}
+
+fn engine_rpm_ratio(engine: &EngineState) -> Option<f32> {
+    (engine.rpm_redline > 0).then(|| engine.rpm.max(0) as f32 / engine.rpm_redline as f32)
+}
+
+fn env_fraction(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_fraction(&value))
+        .unwrap_or(default)
+}
+
+fn env_fraction_with_fallback(name: &str, fallback: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_fraction(&value))
+        .or_else(|| {
+            std::env::var(fallback)
+                .ok()
+                .and_then(|value| parse_fraction(&value))
+        })
+        .unwrap_or(default)
+}
+
+fn parse_fraction(value: &str) -> Option<f32> {
+    let mut value = value.parse::<f32>().ok()?;
+    if value > 1.0 {
+        value /= 100.0;
+    }
+    Some(value.clamp(0.0, 1.0))
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_rgb(value: &str) -> Option<[u8; 3]> {
+    let value = value.trim().trim_start_matches('#');
+    if value.len() != 6 || !value.is_ascii() {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ])
+}
+
+fn load_normal_colors(led_count: usize) -> Vec<[u8; 3]> {
+    if let Ok(value) = std::env::var("MOZA_REV_NORMAL_COLORS") {
+        let entries: Vec<_> = value.split(',').collect();
+        let parsed: Option<Vec<_>> = entries.iter().map(|entry| parse_rgb(entry)).collect();
+        if entries.len() == led_count
+            && let Some(colors) = parsed
+        {
+            return colors;
+        }
+        warn!("invalid MOZA_REV_NORMAL_COLORS; expected {led_count} comma-separated RRGGBB values");
+    }
+
+    default_normal_colors(led_count)
+}
+
+fn default_normal_colors(led_count: usize) -> Vec<[u8; 3]> {
+    let denominator = led_count.max(1) as f32;
+    (0..led_count)
+        .map(|index| match index as f32 / denominator {
+            position if position < 0.4 => [0, 255, 0],
+            position if position < 0.7 => [255, 255, 0],
+            position if position < 0.8 => [255, 128, 0],
+            _ => [255, 0, 0],
+        })
+        .collect()
 }
 
 fn poll_temps(wheel: &mut Moza) {
@@ -323,7 +522,7 @@ fn print_status(
 fn led_bar(bitmask: u32, led_count: usize) -> String {
     (0..led_count)
         .map(|i| {
-            if bitmask & (1 << i) != 0 {
+            if i < 32 && bitmask & (1u32 << i) != 0 {
                 '●'
             } else {
                 '○'
@@ -332,6 +531,8 @@ fn led_bar(bitmask: u32, led_count: usize) -> String {
         .collect()
 }
 
+/// Existing progressive mapping retained for legacy wheels. Modern wheels use
+/// `BlueShiftMapper`, which adds the blue flashing shift-light policy.
 fn rpm_to_bitmask(engine: &EngineState, led_count: usize) -> u32 {
     use std::sync::OnceLock;
 
@@ -428,5 +629,29 @@ mod tests {
             rpm_idle: 0,
         };
         assert_eq!(rpm_to_bitmask(&zero, 10), 0);
+    }
+
+    #[test]
+    fn engine_ratio_normalizes_against_redline() {
+        assert_eq!(engine_rpm_ratio(&engine(4875)), Some(0.75));
+    }
+
+    #[test]
+    fn ten_led_default_colors_match_shift_light_pattern() {
+        assert_eq!(
+            default_normal_colors(10),
+            vec![
+                [0, 255, 0],
+                [0, 255, 0],
+                [0, 255, 0],
+                [0, 255, 0],
+                [255, 255, 0],
+                [255, 255, 0],
+                [255, 255, 0],
+                [255, 128, 0],
+                [255, 0, 0],
+                [255, 0, 0],
+            ]
+        );
     }
 }

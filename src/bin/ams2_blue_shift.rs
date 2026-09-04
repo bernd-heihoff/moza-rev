@@ -1,14 +1,13 @@
 use std::env;
 use std::error::Error;
 use std::io;
-use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use moza_rev::led::blue_shift::{BlueShiftMapper, LED_COUNT};
-use moza_rev::madness::TelemetryPacket;
 use moza_rev::moza::{self, Moza, Protocol};
+use moza_rev::telemetry::engine::EngineSample;
+use moza_rev::telemetry::pc2::{DEFAULT_PORT as PC2_PORT, Pc2Adapter};
 
-const AMS2_PORT: u16 = 5606;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT: Duration = Duration::from_millis(250);
 
@@ -24,12 +23,6 @@ const DEFAULT_NORMAL_COLORS: [[u8; 3]; LED_COUNT] = [
     [255, 0, 0],
     [255, 0, 0],
 ];
-
-struct EngineSample {
-    rpm: i32,
-    redline: i32,
-    received: Instant,
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -76,12 +69,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     wheel.send_telemetry_rpm_colors(&normal_colors)?;
     wheel.send_rpm_bitmask(0, LED_COUNT)?;
 
-    let socket = UdpSocket::bind(("0.0.0.0", AMS2_PORT))?;
-    socket.set_read_timeout(Some(Duration::from_millis(20)))?;
-    println!("Listening for AMS2 telemetry on UDP {AMS2_PORT}");
+    let mut telemetry = Pc2Adapter::bind(PC2_PORT)?;
+    println!("Listening for PC2/Madness telemetry on UDP {PC2_PORT}");
 
-    let mut buffer = vec![0_u8; 2048];
-    let mut latest: Option<EngineSample> = None;
+    let mut latest: Option<(EngineSample, Instant)> = None;
     let mut mapper = BlueShiftMapper::new(
         led_start,
         flash_at,
@@ -94,34 +85,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut last_status = Instant::now();
 
     loop {
-        match socket.recv(&mut buffer) {
-            Ok(length) => {
-                if let Some(packet) = TelemetryPacket::from_bytes(&buffer[..length]) {
-                    let redline = packet.data.redline_rpm();
-
-                    if redline > 0 {
-                        latest = Some(EngineSample {
-                            rpm: packet.data.rpm(),
-                            redline,
-                            received: Instant::now(),
-                        });
-                    }
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(error.into()),
+        if let Some(sample) = telemetry.recv()? {
+            latest = Some((sample, Instant::now()));
         }
 
         let now = Instant::now();
-        let active = latest
-            .as_ref()
-            .filter(|sample| now.duration_since(sample.received) < IDLE_TIMEOUT);
+        let active = latest.as_ref().and_then(|(sample, received)| {
+            if now.duration_since(*received) < IDLE_TIMEOUT {
+                Some(sample)
+            } else {
+                None
+            }
+        });
 
-        let active_ratio = active.map(|sample| sample.rpm.max(0) as f32 / sample.redline as f32);
+        let active_ratio = active.and_then(EngineSample::rpm_ratio);
         let ratio = active_ratio.unwrap_or(0.0);
         let output = mapper.update(active_ratio, now);
 
@@ -153,13 +130,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!(
                     "rpm {:>5}/{:<5} {:>5.1}%  mask=0x{:03X}  {}",
                     sample.rpm,
-                    sample.redline,
+                    sample.redline_rpm,
                     ratio * 100.0,
                     target_mask,
                     if output.flash_mode { "FLASH" } else { "normal" },
                 );
             } else {
-                println!("Waiting for AMS2 telemetry");
+                println!("Waiting for PC2/Madness telemetry");
             }
 
             last_status = now;

@@ -8,4 +8,5 @@ pub mod listeners;
 pub mod madness;
 pub mod moza;
 pub mod outgauge;
+pub mod telemetry;
 pub mod wreckfest;

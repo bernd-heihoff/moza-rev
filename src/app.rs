@@ -116,6 +116,9 @@ pub fn run(args: ListenArgs) -> ExitCode {
     let led_count = args.leds;
     let verbose = args.verbose;
 
+    // When running alongside Boxflat, leave all serial reads to Boxflat.
+    let temp_poll_enabled = std::env::var_os("MOZA_REV_NO_TEMP_POLL").is_none();
+
     // Only do the in-place `\r` rewrite when stdout is a real TTY. Piped
     // output (`moza-rev | tee log.txt`, systemd, journald, etc.) gets
     // newline-terminated lines instead.
@@ -145,7 +148,7 @@ pub fn run(args: ListenArgs) -> ExitCode {
             last_reconnect = Instant::now();
         }
 
-        if last_temp_poll.elapsed() >= TEMP_POLL_INTERVAL {
+        if temp_poll_enabled && last_temp_poll.elapsed() >= TEMP_POLL_INTERVAL {
             if let Some(w) = wheel.as_mut() {
                 poll_temps(w);
             }

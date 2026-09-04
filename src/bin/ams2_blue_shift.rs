@@ -5,11 +5,12 @@ use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use moza_rev::device::moza_led::MozaLedDevice;
-use moza_rev::led::blue_shift::{BlueShiftMapper, LED_COUNT};
+use moza_rev::led::blue_shift::BlueShiftMapper;
 use moza_rev::moza::{self, Protocol};
 use moza_rev::telemetry::engine::EngineSample;
 use moza_rev::telemetry::pc2::{self, DEFAULT_PORT as PC2_PORT};
 
+const LED_COUNT: usize = 10;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT: Duration = Duration::from_millis(250);
 const READ_TIMEOUT: Duration = Duration::from_millis(20);
@@ -77,6 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut buffer = vec![0_u8; 2048];
     let mut latest: Option<(EngineSample, Instant)> = None;
     let mut mapper = BlueShiftMapper::new(
+        LED_COUNT,
         led_start,
         flash_at,
         hysteresis,

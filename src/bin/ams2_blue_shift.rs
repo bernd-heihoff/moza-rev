@@ -4,10 +4,10 @@ use std::io;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
+use moza_rev::led::blue_shift::{BlueShiftMapper, LED_COUNT};
 use moza_rev::madness::TelemetryPacket;
 use moza_rev::moza::{self, Moza, Protocol};
 
-const LED_COUNT: usize = 10;
 const AMS2_PORT: u16 = 5606;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT: Duration = Duration::from_millis(250);
@@ -82,8 +82,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut buffer = vec![0_u8; 2048];
     let mut latest: Option<EngineSample> = None;
-    let mut flash_mode = false;
-    let mut flash_started = Instant::now();
+    let mut mapper = BlueShiftMapper::new(
+        led_start,
+        flash_at,
+        hysteresis,
+        Duration::from_millis(flash_ms),
+        Instant::now(),
+    );
     let mut last_mask: Option<u32> = None;
     let mut last_send = Instant::now();
     let mut last_status = Instant::now();
@@ -116,43 +121,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             .as_ref()
             .filter(|sample| now.duration_since(sample.received) < IDLE_TIMEOUT);
 
-        let ratio = active
-            .map(|sample| sample.rpm.max(0) as f32 / sample.redline as f32)
-            .unwrap_or(0.0);
+        let active_ratio = active.map(|sample| sample.rpm.max(0) as f32 / sample.redline as f32);
+        let ratio = active_ratio.unwrap_or(0.0);
+        let output = mapper.update(active_ratio, now);
 
-        // Hysteresis: enter at 95%, leave below 93% by default.
-        let should_flash = if flash_mode {
-            active.is_some() && ratio >= flash_at - hysteresis
-        } else {
-            active.is_some() && ratio >= flash_at
-        };
-
-        if should_flash != flash_mode {
+        if output.flash_changed {
             // Turn everything off before changing the runtime color table.
             wheel.send_rpm_bitmask(0, LED_COUNT)?;
 
-            if should_flash {
+            if output.flash_mode {
                 wheel.send_telemetry_rpm_colors(&flash_colors)?;
-                flash_started = now;
                 println!("Blue shift flash active");
             } else {
                 wheel.send_telemetry_rpm_colors(&normal_colors)?;
                 println!("Normal RPM colors restored");
             }
 
-            flash_mode = should_flash;
             last_mask = None;
         }
 
-        let target_mask = if active.is_none() {
-            0
-        } else if flash_mode {
-            let phase = (now.duration_since(flash_started).as_millis() / flash_ms as u128) % 2;
-
-            if phase == 0 { full_mask() } else { 0 }
-        } else {
-            progressive_mask(ratio, led_start, flash_at)
-        };
+        let target_mask = output.mask;
 
         if last_mask != Some(target_mask) || last_send.elapsed() >= HEARTBEAT {
             wheel.send_rpm_bitmask(target_mask, LED_COUNT)?;
@@ -168,7 +156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     sample.redline,
                     ratio * 100.0,
                     target_mask,
-                    if flash_mode { "FLASH" } else { "normal" },
+                    if output.flash_mode { "FLASH" } else { "normal" },
                 );
             } else {
                 println!("Waiting for AMS2 telemetry");
@@ -177,22 +165,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_status = now;
         }
     }
-}
-
-fn progressive_mask(ratio: f32, start: f32, full: f32) -> u32 {
-    if ratio < start {
-        return 0;
-    }
-
-    let fraction = ((ratio - start) / (full - start)).clamp(0.0, 1.0);
-    // Divide the progressive range into ten equal RPM intervals.
-    // The tenth LED therefore occupies the final full interval below flashing.
-    let lit = 1 + (fraction * LED_COUNT as f32).floor() as usize;
-    (1_u32 << lit.min(LED_COUNT)) - 1
-}
-
-fn full_mask() -> u32 {
-    (1_u32 << LED_COUNT) - 1
 }
 
 fn env_fraction(name: &str, default: f32) -> f32 {

@@ -333,17 +333,48 @@ fn led_bar(bitmask: u32, led_count: usize) -> String {
 }
 
 fn rpm_to_bitmask(engine: &EngineState, led_count: usize) -> u32 {
-    if engine.rpm_redline <= engine.rpm_idle || led_count == 0 {
+    use std::sync::OnceLock;
+
+    static RPM_RANGE: OnceLock<(f32, f32)> = OnceLock::new();
+
+    if engine.rpm_redline <= 0 || led_count == 0 {
         return 0;
     }
-    let span = (engine.rpm_redline - engine.rpm_idle) as f32;
-    let above_idle = (engine.rpm - engine.rpm_idle).max(0) as f32;
-    let frac = (above_idle / span).clamp(0.0, 1.0);
-    let lit = (frac * led_count as f32).round() as usize;
-    let lit = lit.min(led_count);
-    if lit == 0 {
-        0
-    } else if lit >= 32 {
+
+    let &(start_fraction, full_fraction) = RPM_RANGE.get_or_init(|| {
+        let start = std::env::var("MOZA_REV_LED_START")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.70)
+            .clamp(0.0, 0.99);
+
+        let full = std::env::var("MOZA_REV_LED_FULL")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.96)
+            .clamp(start + 0.01, 1.0);
+
+        (start, full)
+    });
+
+    let redline = engine.rpm_redline as f32;
+    let start_rpm = redline * start_fraction;
+    let full_rpm = redline * full_fraction;
+    let rpm = engine.rpm as f32;
+
+    if rpm < start_rpm {
+        return 0;
+    }
+
+    let fraction = ((rpm - start_rpm) / (full_rpm - start_rpm)).clamp(0.0, 1.0);
+
+    let lit = if led_count == 1 {
+        1
+    } else {
+        1 + (fraction * (led_count - 1) as f32).floor() as usize
+    };
+
+    if lit >= 32 {
         u32::MAX
     } else {
         (1u32 << lit) - 1
@@ -363,8 +394,20 @@ mod tests {
     }
 
     #[test]
-    fn below_idle_lights_nothing() {
-        assert_eq!(rpm_to_bitmask(&engine(500), 10), 0);
+    fn below_led_band_lights_nothing() {
+        // Default LED band starts at 70% of 6500 RPM = 4550 RPM.
+        assert_eq!(rpm_to_bitmask(&engine(4500), 10), 0);
+    }
+
+    #[test]
+    fn start_of_led_band_lights_first_led() {
+        assert_eq!(rpm_to_bitmask(&engine(4600), 10), 0x001);
+    }
+
+    #[test]
+    fn middle_of_led_band_lights_half() {
+        // The default 70%-96% band is roughly half traversed near 5400 RPM.
+        assert_eq!(rpm_to_bitmask(&engine(5400), 10), 0x01F);
     }
 
     #[test]
@@ -375,12 +418,6 @@ mod tests {
     #[test]
     fn above_redline_clamps() {
         assert_eq!(rpm_to_bitmask(&engine(9000), 10), 0x3FF);
-    }
-
-    #[test]
-    fn midband_lights_half() {
-        // (3650 - 800) / (6500 - 800) = 0.5 -> 5 of 10 LEDs
-        assert_eq!(rpm_to_bitmask(&engine(3650), 10), 0x1F);
     }
 
     #[test]

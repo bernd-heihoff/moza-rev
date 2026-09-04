@@ -12,7 +12,7 @@ use std::thread;
 use log::{error, info};
 
 use crate::listeners::{EngineState, GameId, Update};
-use crate::madness;
+use crate::telemetry::pc2;
 
 const GAME: GameId = GameId::Ams2;
 
@@ -61,17 +61,10 @@ fn run(socket: UdpSocket, tx: mpsc::Sender<Update>) {
 }
 
 fn parse(buf: &[u8]) -> Option<EngineState> {
-    // Madness multiplexes 9 packet types on the same port;
-    // TelemetryPacket::from_bytes filters to type 0 (telemetry).
-    let pkt = madness::TelemetryPacket::from_bytes(buf)?;
-    let redline = pkt.data.redline_rpm();
-    // Skip menu / loading frames where the engine isn't initialized.
-    if redline <= 0 {
-        return None;
-    }
+    let sample = pc2::decode(buf)?;
     Some(EngineState {
-        rpm: pkt.data.rpm(),
-        rpm_redline: redline,
+        rpm: sample.rpm,
+        rpm_redline: sample.redline_rpm,
         rpm_idle: ASSUMED_IDLE,
     })
 }

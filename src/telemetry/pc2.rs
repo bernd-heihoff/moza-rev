@@ -1,48 +1,15 @@
-use std::io;
-use std::net::UdpSocket;
-use std::time::Duration;
-
 use crate::madness::{self, TelemetryPacket};
 
 use super::engine::EngineSample;
 
 pub const DEFAULT_PORT: u16 = madness::DEFAULT_PORT;
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(20);
-const BUFFER_SIZE: usize = 2048;
 
-pub struct Pc2Adapter {
-    socket: UdpSocket,
-    buffer: [u8; BUFFER_SIZE],
-}
-
-impl Pc2Adapter {
-    pub fn bind(port: u16) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", port))?;
-        socket.set_read_timeout(Some(DEFAULT_READ_TIMEOUT))?;
-
-        Ok(Self {
-            socket,
-            buffer: [0; BUFFER_SIZE],
-        })
-    }
-
-    pub fn recv(&mut self) -> io::Result<Option<EngineSample>> {
-        match self.socket.recv(&mut self.buffer) {
-            Ok(length) => Ok(sample_from_datagram(&self.buffer[..length])),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
-
-fn sample_from_datagram(data: &[u8]) -> Option<EngineSample> {
+/// Decode one Project CARS 2 / Madness telemetry datagram into the normalized
+/// engine data used by the LED policy layer.
+///
+/// Transport ownership deliberately lives outside this module. Callers may
+/// receive datagrams from a UDP listener, a bridge, a replay, or a test.
+pub fn decode(data: &[u8]) -> Option<EngineSample> {
     let packet = TelemetryPacket::from_bytes(data)?;
     let redline_rpm = packet.data.redline_rpm();
 
@@ -77,7 +44,7 @@ mod tests {
         let data = telemetry_datagram(7_500, 10_000);
 
         assert_eq!(
-            sample_from_datagram(&data),
+            decode(&data),
             Some(EngineSample {
                 rpm: 7_500,
                 redline_rpm: 10_000,
@@ -90,18 +57,18 @@ mod tests {
         let mut data = telemetry_datagram(7_500, 10_000);
         data[10] = PACKET_TYPE_RACE;
 
-        assert_eq!(sample_from_datagram(&data), None);
+        assert_eq!(decode(&data), None);
     }
 
     #[test]
     fn ignores_short_datagrams() {
-        assert_eq!(sample_from_datagram(&[0; 32]), None);
+        assert_eq!(decode(&[0; 32]), None);
     }
 
     #[test]
     fn ignores_samples_without_redline() {
         let data = telemetry_datagram(7_500, 0);
 
-        assert_eq!(sample_from_datagram(&data), None);
+        assert_eq!(decode(&data), None);
     }
 }

@@ -173,59 +173,6 @@ impl Moza {
         Ok(None)
     }
 
-    /// Put a modern wheel's RPM LEDs into host-telemetry mode.
-    pub fn set_rpm_telemetry_mode(&mut self) -> io::Result<()> {
-        if self.protocol != Protocol::Modern {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "runtime RPM colors require the modern wheel protocol",
-            ));
-        }
-
-        // Boxflat: wheel telemetry-mode
-        // group 0x3F, device 0x17, command [0x1C, 0x00], value 1.
-        self.write_frame(&build_frame(
-            GROUP_WHEEL_WRITE,
-            DEVICE_WHEEL,
-            &[0x1C, 0x00],
-            &[1],
-        ))
-    }
-
-    /// Upload the modern wheel's temporary runtime RPM color table.
-    ///
-    /// Colors are RGB. The protocol accepts five indexed colors per
-    /// twenty-byte message.
-    pub fn send_telemetry_rpm_colors(&mut self, colors: &[[u8; 3]]) -> io::Result<()> {
-        if self.protocol != Protocol::Modern {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "runtime RPM colors require the modern wheel protocol",
-            ));
-        }
-
-        for (chunk_number, chunk) in colors.chunks(5).enumerate() {
-            let first_index = chunk_number * 5;
-            let mut payload = Vec::with_capacity(chunk.len() * 4);
-
-            for (offset, rgb) in chunk.iter().enumerate() {
-                payload.push((first_index + offset) as u8);
-                payload.extend_from_slice(rgb);
-            }
-
-            // Boxflat: wheel telemetry-rpm-colors
-            // group 0x3F, device 0x17, command [0x19, 0x00].
-            self.write_frame(&build_frame(
-                GROUP_WHEEL_WRITE,
-                DEVICE_WHEEL,
-                &[0x19, 0x00],
-                &payload,
-            ))?;
-        }
-
-        Ok(())
-    }
-
     pub fn send_rpm_bitmask(&mut self, bitmask: u32, led_count: usize) -> io::Result<()> {
         let dev = self.device_id();
         let frame = match self.protocol {
@@ -417,18 +364,11 @@ pub fn find_wheelbase() -> Option<String> {
 }
 
 fn build_modern_rpm_frame(device: u8, bitmask: u32, led_count: usize) -> Vec<u8> {
-    let window_mask = if led_count >= 32 {
-        u32::MAX
+    let payload: Vec<u8> = if led_count > 16 {
+        bitmask.to_le_bytes().to_vec()
     } else {
-        (1_u32 << led_count) - 1
+        (bitmask as u16).to_le_bytes().to_vec()
     };
-
-    let active_mask = bitmask & window_mask;
-
-    let mut payload = Vec::with_capacity(8);
-    payload.extend_from_slice(&active_mask.to_le_bytes());
-    payload.extend_from_slice(&window_mask.to_le_bytes());
-
     build_frame(GROUP_WHEEL_WRITE, device, &[0x1A, 0x00], &payload)
 }
 

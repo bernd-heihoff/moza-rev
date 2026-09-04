@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+set -u
+
+BRIDGE="/home/bernd/moza-rev/tools/acr-ams2-bridge/acr_to_ams2.exe"
+LAUNCHER="/home/bernd/.local/bin/protontricks-launch"
+LOG="/tmp/acr-bridge-auto.log"
+
+bridge_pid=""
+game_command_pid=""
+acr_pid=""
+
+find_acr_pid() {
+    local proc pid
+    local -a argv
+
+    for proc in /proc/[0-9]*/cmdline; do
+        [[ -r "$proc" ]] || continue
+
+        argv=()
+        mapfile -d '' -t argv < "$proc" 2>/dev/null || continue
+
+        #
+        # The actual Wine-side ACR process appears as a process whose
+        # argv consists solely of the Windows executable path, e.g.
+        #
+        #   S:\common\Assetto Corsa Rally\acr\Binaries\Win64\acr.exe
+        #
+        # Proton/Steam launcher processes also mention acr.exe, but have
+        # multiple arguments and therefore do not match here.
+        #
+        (( ${#argv[@]} == 1 )) || continue
+
+        if [[ "${argv[0]}" == *"Assetto Corsa Rally"* ]] &&
+           [[ "${argv[0]}" == *'\acr\Binaries\Win64\acr.exe' ]]
+        then
+            pid="${proc#/proc/}"
+            pid="${pid%/cmdline}"
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+stop_bridge() {
+    if [[ -n "$bridge_pid" ]]; then
+        kill "$bridge_pid" 2>/dev/null || true
+    fi
+
+    #
+    # Ensure the actual Windows-side bridge process is gone as well.
+    #
+    pkill -TERM -f '[a]cr_to_ams2\.exe' 2>/dev/null || true
+
+    if [[ -n "$bridge_pid" ]]; then
+        wait "$bridge_pid" 2>/dev/null || true
+        bridge_pid=""
+    fi
+}
+
+trap stop_bridge EXIT INT TERM
+
+{
+    printf '\n============================================================\n'
+    printf 'Assetto Corsa Rally bridge launch: %s\n' \
+        "$(date --iso-8601=seconds)"
+    printf '============================================================\n'
+} > "$LOG"
+
+if [[ ! -x "$LAUNCHER" ]]; then
+    printf 'Missing launcher: %s\n' "$LAUNCHER" >> "$LOG"
+    exit 1
+fi
+
+if [[ ! -f "$BRIDGE" ]]; then
+    printf 'Missing bridge: %s\n' "$BRIDGE" >> "$LOG"
+    exit 1
+fi
+
+printf 'Starting Assetto Corsa Rally command\n' >> "$LOG"
+
+#
+# This may itself be a nested command:
+#
+#   mangohud
+#     -> steam-launch-wrapper
+#       -> Steam Runtime
+#         -> Proton waitforexitandrun
+#           -> acr.exe
+#
+"$@" &
+game_command_pid=$!
+
+#
+# Find the actual Wine-side game process. Do not use the lifetime of
+# game_command_pid: Proton waitforexitandrun can remain alive while our
+# telemetry bridge is running in the same prefix.
+#
+printf 'Waiting for Wine-side acr.exe\n' >> "$LOG"
+
+while kill -0 "$game_command_pid" 2>/dev/null; do
+    if acr_pid="$(find_acr_pid)"; then
+        printf 'AC Rally detected as PID %s\n' "$acr_pid" >> "$LOG"
+        break
+    fi
+
+    sleep 1
+done
+
+#
+# If the launch command disappeared before acr.exe ever appeared,
+# propagate its exit status.
+#
+if [[ -z "$acr_pid" ]]; then
+    printf 'AC Rally process was not detected before launch command exited\n' \
+        >> "$LOG"
+
+    wait "$game_command_pid"
+    game_status=$?
+
+    trap - EXIT INT TERM
+    exit "$game_status"
+fi
+
+#
+# Keep the telemetry bridge running for exactly as long as the actual
+# Wine-side ACR process exists.
+#
+while kill -0 "$acr_pid" 2>/dev/null; do
+    printf '\nLaunching telemetry bridge at %s\n' \
+        "$(date --iso-8601=seconds)" >> "$LOG"
+
+    "$LAUNCHER" \
+        --no-bwrap \
+        --appid 3917090 \
+        "$BRIDGE" >> "$LOG" 2>&1 &
+
+    bridge_pid=$!
+
+    #
+    # Wait until either acr.exe or the telemetry bridge exits.
+    #
+    while kill -0 "$acr_pid" 2>/dev/null &&
+          kill -0 "$bridge_pid" 2>/dev/null
+    do
+        sleep 1
+    done
+
+    #
+    # The real game process is gone. Terminate the bridge immediately,
+    # allowing Proton's waitforexitandrun to unwind normally.
+    #
+    if ! kill -0 "$acr_pid" 2>/dev/null; then
+        printf '\nAC Rally PID %s exited; stopping telemetry bridge\n' \
+            "$acr_pid" >> "$LOG"
+        break
+    fi
+
+    #
+    # Bridge exited while ACR is still alive. This commonly happens
+    # during startup before Local\acpmf_physics has been created.
+    #
+    wait "$bridge_pid" 2>/dev/null || true
+    bridge_pid=""
+
+    printf 'Bridge exited; retrying in two seconds\n' >> "$LOG"
+    sleep 2
+done
+
+stop_bridge
+
+#
+# With acr.exe and the Wine-side bridge gone, the nested
+# mangohud/Steam/Proton command should now unwind normally.
+#
+wait "$game_command_pid"
+game_status=$?
+
+printf '\nAssetto Corsa Rally command exited with status %d\n' \
+    "$game_status" >> "$LOG"
+
+trap - EXIT INT TERM
+
+exit "$game_status"

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+set -u
+
+BRIDGE="/home/bernd/moza-rev/tools/acr-ams2-bridge/acr_to_ams2.exe"
+LAUNCHER="/home/bernd/.local/bin/protontricks-launch"
+LOG="/tmp/acr-bridge-auto.log"
+
+bridge_pid=""
+game_pid=""
+
+stop_bridge() {
+    if [[ -n "$bridge_pid" ]]; then
+        kill "$bridge_pid" 2>/dev/null || true
+    fi
+
+    # Ensure the Windows-side bridge process is also terminated.
+    pkill -TERM -f '[a]cr_to_ams2\.exe' 2>/dev/null || true
+
+    if [[ -n "$bridge_pid" ]]; then
+        wait "$bridge_pid" 2>/dev/null || true
+        bridge_pid=""
+    fi
+}
+
+trap stop_bridge EXIT INT TERM
+
+{
+    printf '\n============================================================\n'
+    printf 'Assetto Corsa Rally bridge launch: %s\n' \
+        "$(date --iso-8601=seconds)"
+    printf '============================================================\n'
+} > "$LOG"
+
+if [[ ! -x "$LAUNCHER" ]]; then
+    printf 'Missing launcher: %s\n' "$LAUNCHER" >> "$LOG"
+    exit 1
+fi
+
+if [[ ! -f "$BRIDGE" ]]; then
+    printf 'Missing bridge: %s\n' "$BRIDGE" >> "$LOG"
+    exit 1
+fi
+
+printf 'Starting Assetto Corsa Rally command\n' >> "$LOG"
+
+"$@" &
+game_pid=$!
+
+#
+# Give Proton a little time to start. We do not need to locate acr.exe
+# ourselves: Steam/Proton's waitforexitandrun remains alive for the
+# lifetime of the game.
+#
+sleep 3
+
+#
+# Keep trying the bridge while the Steam/Proton game command exists.
+# acr_to_ams2.exe exits immediately if Local\acpmf_physics does not
+# exist yet, so that serves as our startup detection.
+#
+while kill -0 "$game_pid" 2>/dev/null; do
+    printf '\nLaunching telemetry bridge at %s\n' \
+        "$(date --iso-8601=seconds)" >> "$LOG"
+
+    "$LAUNCHER" \
+        --no-bwrap \
+        --appid 3917090 \
+        "$BRIDGE" >> "$LOG" 2>&1 &
+
+    bridge_pid=$!
+
+    #
+    # Wait until either the game command or telemetry bridge exits.
+    #
+    while kill -0 "$game_pid" 2>/dev/null &&
+          kill -0 "$bridge_pid" 2>/dev/null
+    do
+        sleep 1
+    done
+
+    #
+    # Steam/Proton has exited. The EXIT cleanup will terminate any
+    # remaining Windows-side bridge.
+    #
+    if ! kill -0 "$game_pid" 2>/dev/null; then
+        printf '\nAssetto Corsa Rally command exited; stopping bridge\n' \
+            >> "$LOG"
+        break
+    fi
+
+    #
+    # Bridge exited while the game command is still alive.
+    # Most likely the ACR shared-memory mapping does not exist yet.
+    #
+    wait "$bridge_pid" 2>/dev/null || true
+    bridge_pid=""
+
+    printf 'Bridge exited; retrying in two seconds\n' >> "$LOG"
+    sleep 2
+done
+
+stop_bridge
+
+wait "$game_pid"
+game_status=$?
+
+printf '\nAssetto Corsa Rally command exited with status %d\n' \
+    "$game_status" >> "$LOG"
+
+trap - EXIT INT TERM
+
+exit "$game_status"

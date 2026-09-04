@@ -117,7 +117,8 @@ pub fn run(args: ListenArgs) -> ExitCode {
     let verbose = args.verbose;
 
     // When running alongside Boxflat, leave all serial reads to Boxflat.
-    let temp_poll_enabled = std::env::var_os("MOZA_REV_NO_TEMP_POLL").is_none();
+    let temp_poll_enabled =
+        std::env::var_os("MOZA_REV_NO_TEMP_POLL").is_none();
 
     // Only do the in-place `\r` rewrite when stdout is a real TTY. Piped
     // output (`moza-rev | tee log.txt`, systemd, journald, etc.) gets
@@ -333,48 +334,17 @@ fn led_bar(bitmask: u32, led_count: usize) -> String {
 }
 
 fn rpm_to_bitmask(engine: &EngineState, led_count: usize) -> u32 {
-    use std::sync::OnceLock;
-
-    static RPM_RANGE: OnceLock<(f32, f32)> = OnceLock::new();
-
-    if engine.rpm_redline <= 0 || led_count == 0 {
+    if engine.rpm_redline <= engine.rpm_idle || led_count == 0 {
         return 0;
     }
-
-    let &(start_fraction, full_fraction) = RPM_RANGE.get_or_init(|| {
-        let start = std::env::var("MOZA_REV_LED_START")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
-            .unwrap_or(0.70)
-            .clamp(0.0, 0.99);
-
-        let full = std::env::var("MOZA_REV_LED_FULL")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
-            .unwrap_or(0.96)
-            .clamp(start + 0.01, 1.0);
-
-        (start, full)
-    });
-
-    let redline = engine.rpm_redline as f32;
-    let start_rpm = redline * start_fraction;
-    let full_rpm = redline * full_fraction;
-    let rpm = engine.rpm as f32;
-
-    if rpm < start_rpm {
-        return 0;
-    }
-
-    let fraction = ((rpm - start_rpm) / (full_rpm - start_rpm)).clamp(0.0, 1.0);
-
-    let lit = if led_count == 1 {
-        1
-    } else {
-        1 + (fraction * (led_count - 1) as f32).floor() as usize
-    };
-
-    if lit >= 32 {
+    let span = (engine.rpm_redline - engine.rpm_idle) as f32;
+    let above_idle = (engine.rpm - engine.rpm_idle).max(0) as f32;
+    let frac = (above_idle / span).clamp(0.0, 1.0);
+    let lit = (frac * led_count as f32).round() as usize;
+    let lit = lit.min(led_count);
+    if lit == 0 {
+        0
+    } else if lit >= 32 {
         u32::MAX
     } else {
         (1u32 << lit) - 1

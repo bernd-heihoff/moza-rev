@@ -3,8 +3,9 @@ use std::error::Error;
 use std::io;
 use std::time::{Duration, Instant};
 
+use moza_rev::device::moza_led::MozaLedDevice;
 use moza_rev::led::blue_shift::{BlueShiftMapper, LED_COUNT};
-use moza_rev::moza::{self, Moza, Protocol};
+use moza_rev::moza::{self, Protocol};
 use moza_rev::telemetry::engine::EngineSample;
 use moza_rev::telemetry::pc2::{DEFAULT_PORT as PC2_PORT, Pc2Adapter};
 
@@ -62,12 +63,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         flash_ms,
     );
 
-    let mut wheel = Moza::open(&serial_path, protocol)?;
+    let mut wheel = MozaLedDevice::open(&serial_path, protocol, LED_COUNT)?;
 
     // This replaces the need to click Boxflat's telemetry test.
-    wheel.set_rpm_telemetry_mode()?;
-    wheel.send_telemetry_rpm_colors(&normal_colors)?;
-    wheel.send_rpm_bitmask(0, LED_COUNT)?;
+    wheel.initialize(&normal_colors)?;
 
     let mut telemetry = Pc2Adapter::bind(PC2_PORT)?;
     println!("Listening for PC2/Madness telemetry on UDP {PC2_PORT}");
@@ -104,13 +103,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if output.flash_changed {
             // Turn everything off before changing the runtime color table.
-            wheel.send_rpm_bitmask(0, LED_COUNT)?;
+            wheel.set_mask(0)?;
 
             if output.flash_mode {
-                wheel.send_telemetry_rpm_colors(&flash_colors)?;
+                wheel.set_colors(&flash_colors)?;
                 println!("Blue shift flash active");
             } else {
-                wheel.send_telemetry_rpm_colors(&normal_colors)?;
+                wheel.set_colors(&normal_colors)?;
                 println!("Normal RPM colors restored");
             }
 
@@ -120,7 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let target_mask = output.mask;
 
         if last_mask != Some(target_mask) || last_send.elapsed() >= HEARTBEAT {
-            wheel.send_rpm_bitmask(target_mask, LED_COUNT)?;
+            wheel.set_mask(target_mask)?;
             last_mask = Some(target_mask);
             last_send = now;
         }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use moza_rev::device::moza_led::MozaLedDevice;
 use moza_rev::led::blue_shift::BlueShiftMapper;
-use moza_rev::moza::{self, Protocol};
+use moza_rev::moza::{self, Moza, Protocol};
 use moza_rev::telemetry::engine::EngineSample;
 use moza_rev::telemetry::pc2::{self, DEFAULT_PORT as PC2_PORT};
 
@@ -66,10 +66,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         flash_ms,
     );
 
-    let mut wheel = MozaLedDevice::open(&serial_path, protocol, LED_COUNT)?;
+    let mut wheel = Moza::open(&serial_path, protocol)?;
+    let leds = MozaLedDevice::new(LED_COUNT);
 
     // This replaces the need to click Boxflat's telemetry test.
-    wheel.initialize(&normal_colors)?;
+    leds.initialize(&mut wheel, &normal_colors)?;
 
     let socket = UdpSocket::bind(("0.0.0.0", PC2_PORT))?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -119,13 +120,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if output.flash_changed {
             // Turn everything off before changing the runtime color table.
-            wheel.set_mask(0)?;
+            leds.set_mask(&mut wheel, 0)?;
 
             if output.flash_mode {
-                wheel.set_colors(&flash_colors)?;
+                leds.set_colors(&mut wheel, &flash_colors)?;
                 println!("Blue shift flash active");
             } else {
-                wheel.set_colors(&normal_colors)?;
+                leds.set_colors(&mut wheel, &normal_colors)?;
                 println!("Normal RPM colors restored");
             }
 
@@ -135,7 +136,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let target_mask = output.mask;
 
         if last_mask != Some(target_mask) || last_send.elapsed() >= HEARTBEAT {
-            wheel.set_mask(target_mask)?;
+            leds.set_mask(&mut wheel, target_mask)?;
             last_mask = Some(target_mask);
             last_send = now;
         }

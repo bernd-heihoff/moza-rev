@@ -173,6 +173,59 @@ impl Moza {
         Ok(None)
     }
 
+    /// Put a modern wheel's RPM LEDs into host-telemetry mode.
+    pub fn set_rpm_telemetry_mode(&mut self) -> io::Result<()> {
+        if self.protocol != Protocol::Modern {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "runtime RPM colors require the modern wheel protocol",
+            ));
+        }
+
+        // Boxflat: wheel telemetry-mode
+        // group 0x3F, device 0x17, command [0x1C, 0x00], value 1.
+        self.write_frame(&build_frame(
+            GROUP_WHEEL_WRITE,
+            DEVICE_WHEEL,
+            &[0x1C, 0x00],
+            &[1],
+        ))
+    }
+
+    /// Upload the modern wheel's temporary runtime RPM color table.
+    ///
+    /// Colors are RGB. The protocol accepts five indexed colors per
+    /// twenty-byte message.
+    pub fn send_telemetry_rpm_colors(&mut self, colors: &[[u8; 3]]) -> io::Result<()> {
+        if self.protocol != Protocol::Modern {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "runtime RPM colors require the modern wheel protocol",
+            ));
+        }
+
+        for (chunk_number, chunk) in colors.chunks(5).enumerate() {
+            let first_index = chunk_number * 5;
+            let mut payload = Vec::with_capacity(chunk.len() * 4);
+
+            for (offset, rgb) in chunk.iter().enumerate() {
+                payload.push((first_index + offset) as u8);
+                payload.extend_from_slice(rgb);
+            }
+
+            // Boxflat: wheel telemetry-rpm-colors
+            // group 0x3F, device 0x17, command [0x19, 0x00].
+            self.write_frame(&build_frame(
+                GROUP_WHEEL_WRITE,
+                DEVICE_WHEEL,
+                &[0x19, 0x00],
+                &payload,
+            ))?;
+        }
+
+        Ok(())
+    }
+
     pub fn send_rpm_bitmask(&mut self, bitmask: u32, led_count: usize) -> io::Result<()> {
         let dev = self.device_id();
         let frame = match self.protocol {
@@ -364,11 +417,18 @@ pub fn find_wheelbase() -> Option<String> {
 }
 
 fn build_modern_rpm_frame(device: u8, bitmask: u32, led_count: usize) -> Vec<u8> {
-    let payload: Vec<u8> = if led_count > 16 {
-        bitmask.to_le_bytes().to_vec()
+    let window_mask = if led_count >= 32 {
+        u32::MAX
     } else {
-        (bitmask as u16).to_le_bytes().to_vec()
+        (1_u32 << led_count) - 1
     };
+
+    let active_mask = bitmask & window_mask;
+
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&active_mask.to_le_bytes());
+    payload.extend_from_slice(&window_mask.to_le_bytes());
+
     build_frame(GROUP_WHEEL_WRITE, device, &[0x1A, 0x00], &payload)
 }
 
@@ -444,26 +504,37 @@ mod tests {
     #[test]
     fn modern_rpm_frame_no_leds_lit() {
         let frame = build_modern_rpm_frame(DEVICE_WHEEL, 0, 10);
+
+        // Modern protocol uses two little-endian u32 masks:
+        // active LEDs, followed by the available LED window.
+        assert_eq!(frame[1], 10);
         assert_eq!(
-            frame,
-            vec![0x7E, 0x04, 0x3F, 0x17, 0x1A, 0x00, 0x00, 0x00, 0xFF]
+            &frame[6..14],
+            &[0x00, 0x00, 0x00, 0x00, 0xff, 0x03, 0x00, 0x00]
         );
     }
 
     #[test]
     fn modern_rpm_frame_all_10_lit() {
-        let frame = build_modern_rpm_frame(DEVICE_WHEEL, 0x03FF, 10);
+        let frame = build_modern_rpm_frame(DEVICE_WHEEL, 0x3ff, 10);
+
+        assert_eq!(frame[1], 10);
         assert_eq!(
-            frame,
-            vec![0x7E, 0x04, 0x3F, 0x17, 0x1A, 0x00, 0xFF, 0x03, 0x01]
+            &frame[6..14],
+            &[0xff, 0x03, 0x00, 0x00, 0xff, 0x03, 0x00, 0x00]
         );
     }
 
     #[test]
-    fn modern_rpm_frame_18_leds_uses_4_byte_payload() {
-        let frame = build_modern_rpm_frame(DEVICE_WHEEL, 0x0003_FFFF, 18);
-        assert_eq!(&frame[..6], &[0x7E, 0x06, 0x3F, 0x17, 0x1A, 0x00]);
-        assert_eq!(&frame[6..10], &[0xFF, 0xFF, 0x03, 0x00]);
+    fn modern_rpm_frame_18_leds_uses_8_byte_payload() {
+        let frame = build_modern_rpm_frame(DEVICE_WHEEL, u32::MAX, 18);
+
+        // Bits outside the configured 18-LED window are masked off.
+        assert_eq!(frame[1], 10);
+        assert_eq!(
+            &frame[6..14],
+            &[0xff, 0xff, 0x03, 0x00, 0xff, 0xff, 0x03, 0x00]
+        );
     }
 
     #[test]
